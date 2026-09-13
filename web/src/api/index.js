@@ -1,0 +1,81 @@
+import { createAlova } from 'alova';
+import adapterFetch from 'alova/fetch';
+import vueHook from 'alova/vue';
+
+/**
+ * 统一请求实例。生产环境由 server.js 同源服务，开发环境经 vite proxy 转发。
+ */
+export const alova = createAlova({
+  statesHook: vueHook,
+  requestAdapter: adapterFetch(),
+  timeout: 20000,
+  cacheFor: { GET: 0 },
+  responded: async (response) => {
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const msg = body?.error?.message || body?.error || `HTTP ${response.status}`;
+      // 管理页鉴权失效：跳转到登录页
+      if (response.status === 401 && body?.error?.type === 'admin_auth_required') {
+        const path = window.location.pathname;
+        if (path !== '/admin-login') {
+          const back = path === '/home' ? '' : '?back=' + encodeURIComponent(path);
+          window.location.href = '/admin-login' + back;
+        }
+      }
+      throw new Error(typeof msg === 'string' ? msg : JSON.stringify(msg));
+    }
+    return body;
+  },
+});
+
+function withQuery(path, params = {}) {
+  const qs = new URLSearchParams();
+  Object.entries(params).forEach(([k, v]) => {
+    if (v !== undefined && v !== null && v !== '') qs.set(k, String(v));
+  });
+  const s = qs.toString();
+  return s ? `${path}?${s}` : path;
+}
+
+export const api = {
+  status: () => alova.Get('/api/status'),
+  config: () => alova.Get('/api/config'),
+  saveConfig: (patch) => alova.Put('/api/config', patch),
+  logs: (params = {}) => alova.Get(withQuery('/api/logs', params)),
+  clearLogs: () => alova.Delete('/api/logs'),
+  stats: () => alova.Get('/api/stats'),
+  importVscode: () => alova.Get('/api/import-vscode'),
+  logout: () => alova.Post('/api/logout'),
+  loginState: () => alova.Get('/login/state'),
+  loginStatus: (state) => alova.Get(`/login/status?state=${encodeURIComponent(state)}`),
+  listAccounts: () => alova.Get('/api/accounts'),
+  accountLogin: (name, region) => alova.Post('/api/accounts/login', { name, region }),
+  importAccount: (payload) => alova.Post('/api/accounts/import', payload),
+  accountLoginStatus: (state) => alova.Get(`/api/accounts/login/status?state=${encodeURIComponent(state)}`),
+  renameAccount: (id, name) => alova.Put(`/api/accounts/${encodeURIComponent(id)}`, { name }),
+  setAutoCheckin: (autoCheckin) => alova.Put('/api/accounts', { autoCheckin }),
+  setAccountAutoCheckin: (id, autoCheckin) => alova.Put(`/api/accounts/${encodeURIComponent(id)}`, { autoCheckin }),
+  deleteAccount: (id) => alova.Delete(`/api/accounts/${encodeURIComponent(id)}`),
+  getPool: () => alova.Get('/api/pool'),
+  setPool: (patch) => alova.Put('/api/pool', patch),
+  listModels: () => alova.Get('/api/models'),
+  addModel: (model) => alova.Post('/api/models', model),
+  deleteModel: (id) => alova.Delete(`/api/models/${encodeURIComponent(id)}`),
+  setModelHidden: (id, hidden) => alova.Put(`/api/models/${encodeURIComponent(id)}/hidden`, { hidden }),
+  listKeys: () => alova.Get('/api/keys'),
+  addKey: (payload) => alova.Post('/api/keys', payload),
+  regenerateKey: (id) => alova.Post(`/api/keys/regenerate/${encodeURIComponent(id)}`),
+  setKeyAccount: (id, accountId) => alova.Put(`/api/keys/${encodeURIComponent(id)}`, { accountId }),
+  deleteKey: (id) => alova.Delete(`/api/keys/${encodeURIComponent(id)}`),
+  usage: (params = {}) => alova.Get(withQuery('/api/usage', params)),
+  usageStats: (params = {}) => alova.Get(withQuery('/api/usage/stats', params)),
+  checkinStatus: (accountId) => alova.Get(withQuery('/api/checkin/status', { accountId })),
+  dailyCheckin: (accountId) => alova.Post('/api/checkin', { accountId }),
+  credits: (accountId) => alova.Get(withQuery('/api/credits', { accountId })),
+
+  // 管理页鉴权
+  adminStatus: () => alova.Get('/api/admin/status'),
+  adminLogin: (payload) => alova.Post('/api/admin/login', payload),
+  adminLogout: () => alova.Post('/api/admin/logout'),
+  adminChangePassword: (payload) => alova.Post('/api/admin/change-password', payload),
+};

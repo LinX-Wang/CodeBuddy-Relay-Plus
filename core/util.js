@@ -1,0 +1,313 @@
+'use strict';
+
+/** 通用工具：HTTP 请求封装、响应发送、字符串工具等 */
+
+const http = require('http');
+const https = require('https');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const { URL } = require('url');
+
+/** JSON 请求，返回 { status, headers, body, json } */
+function requestJson(urlStr, { method = 'GET', headers = {}, body = null, timeoutMs = 30000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlStr);
+    const mod = u.protocol === 'https:' ? https : http;
+    const payload = body == null ? null : (typeof body === 'string' ? body : JSON.stringify(body));
+    const finalHeaders = { ...headers };
+    if (payload != null && !finalHeaders['Content-Type']) finalHeaders['Content-Type'] = 'application/json';
+    if (payload != null) finalHeaders['Content-Length'] = Buffer.byteLength(payload);
+
+    const req = mod.request(u, { method, headers: finalHeaders, timeout: timeoutMs }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8');
+        let json = null;
+        try { json = JSON.parse(text); } catch { /* not json */ }
+        resolve({ status: res.statusCode || 0, headers: res.headers, body: text, json });
+      });
+    });
+    req.on('timeout', () => req.destroy(new Error('request timeout')));
+    req.on('error', reject);
+    if (payload != null) req.write(payload);
+    req.end();
+  });
+}
+
+/** 原始请求，返回 { status, headers, body } 字符串（用于收集 SSE 流） */
+function requestRaw(urlStr, { method = 'POST', headers = {}, body = null, timeoutMs = 300000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlStr);
+    const mod = u.protocol === 'https:' ? https : http;
+    const payload = body == null ? null : (typeof body === 'string' ? body : JSON.stringify(body));
+    const finalHeaders = { ...headers };
+    if (payload != null && !finalHeaders['Content-Type']) finalHeaders['Content-Type'] = 'application/json';
+    if (payload != null) finalHeaders['Content-Length'] = Buffer.byteLength(payload);
+
+    const req = mod.request(u, { method, headers: finalHeaders, timeout: timeoutMs }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({ status: res.statusCode || 0, headers: res.headers, body: Buffer.concat(chunks).toString('utf8') }));
+    });
+    req.on('timeout', () => req.destroy(new Error('request timeout')));
+    req.on('error', reject);
+    if (payload != null) req.write(payload);
+    req.end();
+  });
+}
+
+/** 把上游响应透传给客户端（用于 SSE 流式转发） */
+function pipeToClient(clientRes, urlStr, { method = 'POST', headers = {}, body = null, extraHeaders = {}, onChunk = null }, onDone) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlStr);
+    const mod = u.protocol === 'https:' ? https : http;
+    const payload = body == null ? null : (typeof body === 'string' ? body : JSON.stringify(body));
+    const finalHeaders = { ...headers };
+    if (payload != null && !finalHeaders['Content-Type']) finalHeaders['Content-Type'] = 'application/json';
+    if (payload != null) finalHeaders['Content-Length'] = Buffer.byteLength(payload);
+
+    const upstream = mod.request(u, { method, headers: finalHeaders }, (upRes) => {
+      const respHeaders = streamHeaders(upRes.headers, extraHeaders);
+      clientRes.writeHead(upRes.statusCode || 502, respHeaders);
+      upRes.on('data', (chunk) => {
+        if (onChunk) {
+          try { onChunk(chunk); } catch { /* 统计解析不能影响透传 */ }
+        }
+        if (!clientRes.write(chunk)) upRes.pause();
+      });
+      clientRes.on('drain', () => upRes.resume());
+      upRes.on('end', () => {
+        if (onDone) onDone({ status: upRes.statusCode === 200 ? 'ok' : 'error' });
+        if (!clientRes.writableEnded) clientRes.end();
+        resolve();
+      });
+      upRes.on('aborted', () => {
+        if (onDone) onDone({ status: 'error' });
+        if (!clientRes.writableEnded) clientRes.end();
+        reject(new Error('upstream response aborted'));
+      });
+      upRes.on('error', (e) => {
+        if (onDone) onDone({ status: 'error' });
+        reject(e);
+      });
+    });
+    clientRes.on('close', () => {
+      if (!clientRes.writableEnded) upstream.destroy();
+    });
+    upstream.on('error', (e) => {
+      if (!clientRes.headersSent) {
+        clientRes.writeHead(502, { 'Content-Type': 'application/json' });
+        clientRes.end(JSON.stringify({ error: { message: `upstream error: ${e.message}`, type: 'proxy_upstream_error' } }));
+      }
+      reject(e);
+    });
+    if (payload != null) upstream.write(payload);
+    upstream.end();
+  });
+}
+
+const HOP_BY_HOP_HEADERS = new Set([
+  'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+  'te', 'trailer', 'transfer-encoding', 'upgrade', 'content-length',
+]);
+
+function streamHeaders(upstreamHeaders = {}, extraHeaders = {}) {
+  const out = {};
+  for (const [name, value] of Object.entries(upstreamHeaders)) {
+    if (!HOP_BY_HOP_HEADERS.has(name.toLowerCase())) out[name] = value;
+  }
+  return { ...out, ...extraHeaders };
+}
+
+/**
+ * 把上游 SSE 流转发到客户端，同时解析其中的 token 用量。
+ * onDone({ usage, status }) 在流结束时回调。usage 为 OpenAI chat.completion.chunk 里的 usage 对象。
+ * 兼容 `stream_options.include_usage` 的最后一块，也兼容流结束后单独追加的 usage 块。
+ */
+function pipeSseToClient(clientRes, urlStr, { method = 'POST', headers = {}, body = null, extraHeaders = {} }, onDone) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlStr);
+    const mod = u.protocol === 'https:' ? https : http;
+    const payload = body == null ? null : (typeof body === 'string' ? body : JSON.stringify(body));
+    const finalHeaders = { ...headers };
+    if (payload != null && !finalHeaders['Content-Type']) finalHeaders['Content-Type'] = 'application/json';
+    if (payload != null) finalHeaders['Content-Length'] = Buffer.byteLength(payload);
+
+    let usage = null;
+    let sawDone = false;
+    let status = 'ok';
+    const report = () => { if (onDone) try { onDone({ usage, status }); } catch { /* ignore */ } };
+
+    const upstream = mod.request(u, { method, headers: finalHeaders }, (upRes) => {
+      const respHeaders = streamHeaders(upRes.headers, extraHeaders);
+      clientRes.writeHead(upRes.statusCode || 502, respHeaders);
+      if (upRes.statusCode !== 200) status = 'error';
+
+      let buf = '';
+      upRes.setEncoding('utf8');
+      upRes.on('data', (chunk) => {
+        buf += chunk;
+        // 边写边解析，尽量低延迟转发
+        clientRes.write(chunk);
+        let idx;
+        while ((idx = sseBoundaryIndex(buf)) !== -1) {
+          const block = buf.slice(0, idx);
+          buf = buf.slice(idx + sseBoundaryLength(buf, idx));
+          for (const line of block.split('\n')) {
+            const t = line.trim();
+            if (!t.startsWith('data:')) continue;
+            const data = t.slice(5).trim();
+            if (!data) continue;
+            if (data === '[DONE]') { sawDone = true; continue; }
+            try {
+              const obj = JSON.parse(data);
+              if (obj && obj.usage) usage = obj.usage;
+            } catch { /* skip */ }
+          }
+        }
+      });
+      upRes.on('end', () => {
+        if (buf.trim()) {
+          for (const line of buf.split('\n')) {
+            const t = line.trim();
+            if (!t.startsWith('data:')) continue;
+            const data = t.slice(5).trim();
+            if (!data) continue;
+            if (data === '[DONE]') { sawDone = true; continue; }
+            try {
+              const obj = JSON.parse(data);
+              if (obj && obj.usage) usage = obj.usage;
+            } catch { /* skip */ }
+          }
+        }
+        if (!sawDone) status = 'error';
+        clientRes.end();
+        report();
+        resolve();
+      });
+      upRes.on('aborted', () => {
+        status = 'error';
+        report();
+        if (!clientRes.writableEnded) clientRes.end();
+        reject(new Error('upstream response aborted'));
+      });
+      upRes.on('error', (e) => { status = 'error'; report(); reject(e); });
+    });
+    clientRes.on('close', () => {
+      if (!clientRes.writableEnded) upstream.destroy();
+    });
+    upstream.on('error', (e) => {
+      if (!clientRes.headersSent) {
+        clientRes.writeHead(502, { 'Content-Type': 'application/json' });
+        clientRes.end(JSON.stringify({ error: { message: `upstream error: ${e.message}`, type: 'proxy_upstream_error' } }));
+      }
+      status = 'error';
+      report();
+      reject(e);
+    });
+    if (payload != null) upstream.write(payload);
+    upstream.end();
+  });
+}
+
+function sseBoundaryIndex(value) {
+  const match = /\r?\n\r?\n/.exec(value);
+  return match ? match.index : -1;
+}
+
+function sseBoundaryLength(value, index) {
+  return value[index] === '\r' ? 4 : 2;
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+function corsHeaders() {
+  let origin = '*';
+  try { origin = require('./store').getCorsOrigin() || '*'; } catch { /* store 尚未就绪 */ }
+  return {
+    'Access-Control-Allow-Origin': origin,
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': '*',
+  };
+}
+
+function sendJson(res, status, obj) {
+  const text = JSON.stringify(obj);
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(text),
+    ...corsHeaders(),
+  });
+  res.end(text);
+}
+
+function sendHtml(res, status, html) {
+  res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8', ...corsHeaders() });
+  res.end(html);
+}
+
+const MIME_TYPES = {
+  '.html': 'text/html; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.mjs': 'application/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.map': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.ico': 'image/x-icon',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.ttf': 'font/ttf',
+  '.txt': 'text/plain; charset=utf-8',
+};
+
+/** 以正确的 MIME 流式返回一个静态文件 */
+function sendFile(res, filePath) {
+  fs.stat(filePath, (err, st) => {
+    if (err || !st.isFile()) {
+      sendJson(res, 404, { error: { message: 'Not Found' } });
+      return;
+    }
+    const mime = MIME_TYPES[path.extname(filePath).toLowerCase()] || 'application/octet-stream';
+    res.writeHead(200, {
+      'Content-Type': mime,
+      'Content-Length': st.size,
+      ...corsHeaders(),
+    });
+    fs.createReadStream(filePath).pipe(res);
+  });
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function maskedToken(tok) {
+  if (!tok) return '';
+  if (tok.length <= 8) return '***';
+  return `${tok.slice(0, 6)}…${tok.slice(-4)}`;
+}
+
+function genId(prefix) {
+  return `${prefix}_${crypto.randomBytes(12).toString('hex')}`;
+}
+
+module.exports = {
+  requestJson, requestRaw, pipeToClient, pipeSseToClient, readBody,
+  sendJson, sendHtml, sendFile, MIME_TYPES, corsHeaders,
+  escapeHtml, maskedToken, genId,
+};

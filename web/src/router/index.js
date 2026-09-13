@@ -1,0 +1,22 @@
+import { createRouter, createWebHistory } from 'vue-router';
+
+const routes = [
+  { path: '/', redirect: '/home' },
+  { path: '/home', name: 'overview', component: () => import('@/views/OverviewView.vue'), meta: { title: 'overview' } },
+  { path: '/models', name: 'models', component: () => import('@/views/ModelsView.vue'), meta: { title: 'models' } },
+  { path: '/accounts', name: 'accounts', component: () => import('@/views/AccountsView.vue'), meta: { title: 'accounts' } },
+  { path: '/logs', name: 'logs', component: () => import('@/views/LogsView.vue'), meta: { title: 'logs' } },
+  { path: '/apikeys', name: 'apikeys', component: () => import('@/views/ApiKeysView.vue'), meta: { title: 'apikeys' } },
+  { path: '/usage', name: 'usage', component: () => import('@/views/UsageView.vue'), meta: { title: 'usage' } },
+  { path: '/settings', name: 'settings', component: () => import('@/views/SettingsView.vue'), meta: { title: 'settings' } },
+  { path: '/login', name: 'login', component: () => import('@/views/LoginView.vue'), meta: { title: 'login' } },
+  { path: '/admin-login', name: 'adminLogin', component: () => import('@/views/AdminLoginView.vue'), meta: { title: 'login' } },
+  { path: '/:pathMatch(.*)*', redirect: '/home' },
+];
+
+const router = createRouter({
+  history: createWebHistory(),
+  routes,
+});
+
+export default router;
