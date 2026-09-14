@@ -156,4 +156,11 @@ function getModelRegion(modelId, customModels) {
   return 'cn';
 }
 
-module.exports = { MODEL_CATALOG, allModels, modelsResponse, getModelRegion };
+function getModelMultiplier(modelId, customModels) {
+  const m = allModels(customModels || [], []).find((item) => item.id === modelId);
+  const n = m && Number(m.multiplier);
+  // 国内模型目录通常不公开倍率；未知时仅使用兜底计费系数，UI 不显示为真实倍率。
+  return Number.isFinite(n) && n >= 0 ? n : 0.001;
+}
+
+module.exports = { MODEL_CATALOG, allModels, modelsResponse, getModelRegion, getModelMultiplier };
