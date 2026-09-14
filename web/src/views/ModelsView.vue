@@ -10,6 +10,8 @@ const { data: status, loading, send: reload } = useRequest(() => api.status());
 const { data: modelData, send: reloadModels } = useRequest(() => api.listModels());
 
 const activeRegion = ref('cn');
+const syncing = ref(false);
+async function syncMultipliers() { syncing.value = true; try { const r = await api.syncModelMultipliers(activeRegion.value); await reloadModels(); await reload(); alert(`已同步 ${r.updated} 个模型倍率${r.skipped?.length ? `，${r.skipped.length} 个未识别` : ''}`); } catch (e) { alert(`同步失败: ${e.message}`); } finally { syncing.value = false; } }
 const allModels = computed(() => modelData.value?.models || status.value?.models || []);
 const models = computed(() => allModels.value.filter((m) => (m.region || 'cn') === activeRegion.value));
 
@@ -108,7 +110,7 @@ async function toggleHidden(m) {
           {{ t('models.title') }}
           <span class="sub">{{ t('overview.modelCount', { count: models.length }) }}</span>
         </h2>
-        <button class="btn btn-primary" @click="openAdd">+ {{ t('models.add') }}</button>
+        <div><button class="btn btn-ghost" :disabled="syncing" @click="syncMultipliers">{{ syncing ? '同步中…' : '同步真实倍率' }}</button><button class="btn btn-primary" @click="openAdd">+ {{ t('models.add') }}</button></div>
       </div>
 
       <div class="model-tabs" role="tablist">
@@ -127,6 +129,7 @@ async function toggleHidden(m) {
               <th>{{ t('models.colName') }}</th>
               <th>{{ t('models.colCtx') }}</th>
               <th>{{ t('models.colOutput') }}</th>
+              <th>倍率</th>
               <th>{{ t('models.colCapabilities') }}</th>
               <th>{{ t('models.colSource') }}</th>
               <th></th>
@@ -145,6 +148,7 @@ async function toggleHidden(m) {
               <td>{{ m.name }}</td>
               <td class="mono muted">{{ m.maxInputTokens ? Math.round(m.maxInputTokens / 1000) + 'k' : '—' }}</td>
               <td class="mono muted">{{ m.maxOutputTokens ? Math.round(m.maxOutputTokens / 1000) + 'k' : '—' }}</td>
+              <td class="mono">{{ m.multiplier != null ? m.multiplier : (m.region === 'cn' ? '未同步' : '—') }}</td>
               <td>
                 <span v-if="m.tools" class="tag">{{ t('models.tool') }}</span>
                 <span v-if="m.vision" class="tag">{{ t('models.vision') }}</span>
