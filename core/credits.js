@@ -90,6 +90,7 @@ async function getCredits(accountId) {
   const usageLeft = resources.reduce((s, x) => s + x.left, 0);
   const usageTotal = resources.reduce((s, x) => s + x.total, 0);
   const usageUsed = resources.reduce((s, x) => s + x.used, 0);
+  if (account && account.id && store.updateAccountBalance) store.updateAccountBalance(account.id, usageTotal, usageLeft);
 
   // 今日消耗 = 当前已消耗积分 - 今日 0 时快照的已消耗积分。
   // 若今天还没有快照（比如服务刚启动、还没到 0 时调度器快照），则把当前值
