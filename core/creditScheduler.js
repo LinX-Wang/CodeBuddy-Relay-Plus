@@ -57,6 +57,7 @@ async function tick() {
   if (running) return;
   running = true;
   try {
+    await reconcilePendingUsage();
     const now = Date.now();
     const dateKey = todayKey(now);
     const cfg = store.getConfig();
@@ -77,6 +78,22 @@ async function tick() {
     logger.log('error', 'system', '积分快照调度出错: ' + (e.stack || e.message));
   } finally {
     running = false;
+  }
+}
+
+/** 上游积分有延迟：约一分钟后按账号余额变化校正最近一条估算记录。 */
+async function reconcilePendingUsage() {
+  const rows = store.listPendingUsage(60 * 1000, 50);
+  for (const row of rows) {
+    try {
+      const before = store.accountHealth(row.account_id);
+      const r = await credits.getCredits(row.account_id);
+      if (!r || !r.ok) continue;
+      const prev = before && Number(before.balance_remain);
+      const actual = Number.isFinite(prev) && prev > 0 ? Math.max(0, prev - r.usageLeft) : Number(row.estimated_credits || 0);
+      store.setUsageActualCredits(row.id, actual);
+      logger.log('debug', 'auth', `积分校正完成: ${row.id} estimated=${row.estimated_credits} actual=${actual}`);
+    } catch (e) { logger.log('debug', 'auth', '积分校正跳过: ' + e.message); }
   }
 }
 
