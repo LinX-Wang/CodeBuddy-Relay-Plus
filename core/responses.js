@@ -424,6 +424,7 @@ function streamChatToResponses(clientRes, urlStr, headers, body, originalReq) {
       let buf = '';
       upRes.setEncoding('utf8');
       upRes.on('data', (chunk) => {
+        if (!originalReq._firstByteAt) originalReq._firstByteAt = Date.now();
         buf += chunk;
         let idx;
         while ((idx = sseBoundaryIndex(buf)) !== -1) {
@@ -564,11 +565,16 @@ async function handleResponses(req, res) {
       totalTokens: usage && (usage.total_tokens != null ? usage.total_tokens : (usage.input_tokens + usage.output_tokens)),
       cachedTokens: cached,
       durationMs: Date.now() - startedAt,
+      ttfbMs: req._firstByteAt ? req._firstByteAt - startedAt : 0,
+      clientIp,
+      estimatedCredits: ((usage && (usage.total_tokens || usage.input_tokens + usage.output_tokens)) || 0) * models.getModelMultiplier(chatPayload.model, store.listModels()),
+      errorKind: status === 'error' ? 'upstream' : '',
       status,
     });
   };
 
-  const headers = { ...auth.buildAuthHeaders(acct), 'Content-Type': 'application/json', 'Accept': 'text/event-stream', 'Accept-Encoding': 'identity' };
+  const clientIp = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.headers['x-real-ip'] || req.socket?.remoteAddress || '';
+  const headers = { ...auth.buildAuthHeaders(acct), 'X-Agent-Purpose': 'conversation', 'X-IDE-Name': 'CodeBuddy-Relay-Plus', 'X-IDE-Type': 'CodeBuddy-Relay-Plus', 'X-Product': 'CodeBuddy-Relay-Plus', ...(clientIp ? { 'X-Forwarded-For': clientIp, 'X-Real-IP': clientIp, 'X-Client-IP': clientIp } : {}), 'Content-Type': 'application/json', 'Accept': 'text/event-stream', 'Accept-Encoding': 'identity' };
   const rc = config.regionConfig(acct.region);
   const targetUrl = `${rc.endpoint}/v2/chat/completions`;
   const jsonBody = JSON.stringify(chatPayload);
@@ -594,7 +600,8 @@ async function handleResponses(req, res) {
       if (ct.includes('text/event-stream') || r.body.includes('chat.completion.chunk')) {
         const completion = openai.aggregateSseToCompletion(r.body);
         logger.log('info', 'responses', `完成 (${Date.now() - startedAt}ms)`, logger.requestSummary(payload, { stream: false, durationMs: Date.now() - startedAt, tokens: completion.usage && completion.usage.total_tokens }));
-        record(completion.usage, 'ok');
+      record(completion.usage, 'ok');
+        store.markAccountHealthy(acct.id);
         util.sendJson(res, 200, chatCompletionToResponse(completion, payload));
       } else {
         record(null, r.status === 200 ? 'ok' : 'error');
@@ -605,6 +612,7 @@ async function handleResponses(req, res) {
   } catch (e) {
     logger.log('error', 'responses', `上游错误: ${e.message}`, logger.requestSummary(payload, { durationMs: Date.now() - startedAt }));
     record(null, 'error');
+    store.markAccountError(acct.id, 'transport', e.message, 30 * 1000);
     if (!res.headersSent) util.sendJson(res, 502, { error: { message: `upstream error: ${e.message}`, type: 'proxy_upstream_error' } });
     else res.end();
   }
