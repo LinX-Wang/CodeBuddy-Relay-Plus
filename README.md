@@ -10,6 +10,7 @@
 - 管理页内置 OAuth 登录、账号池、账号刷新、签到和积分查询。
 - 支持多账号轮询、指定账号及 API 密钥绑定账号。
 - 支持原生上游流式链路、`/v1/responses`、`/v1/chat/completions`、`/v1/completions`、`/v1/embeddings`。
+- 支持 Anthropic Messages 原生协议 `/v1/messages`，兼容 Claude Code、CC Switch 等客户端。
 - 支持文本、图片、音频、文件、多轮工具调用和函数参数增量事件。
 - 支持 Codex CLI、Cursor、Continue、OpenAI SDK、Claude Code/CC Switch 等客户端的协议接入。
 - 管理页提供总览、Token 趋势、账号、模型、API 密钥、用量、日志和系统设置。
@@ -63,9 +64,12 @@ Windows 用户也可以双击桌面目录 `D:\DeskTop\CodeBuddy-Relay-Plus\start
 
 - Chat Completions：调用 `POST /v1/chat/completions`。
 - Responses / Codex CLI：调用 `POST /v1/responses`，保留原生 Responses 流式事件、工具调用和多轮上下文适配。
+- Anthropic / Claude Code：调用 `POST /v1/messages`，服务端转换为上游 Chat 请求并返回 Anthropic Message/SSE 事件。
 - 其他兼容接口：`/v1/completions`、`/v1/embeddings`、`/v1/models`。
 
 使用 API 密钥时添加：`Authorization: Bearer 你的密钥`。
+
+Claude Code / Anthropic 客户端可直接使用原生 Messages 协议：Base URL 填 `http://127.0.0.1:3800`（不要附加 `/v1`），客户端会请求 `/v1/messages`；API Key 使用管理页创建的密钥。`/v1/messages/count_tokens` 也已提供本地估算接口。
 
 ## 中文输出
 
