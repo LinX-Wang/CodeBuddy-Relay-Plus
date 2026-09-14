@@ -116,7 +116,7 @@ const PUBLIC_PROXY_PATHS = [
   '/v1/chat/completions', '/chat/completions',
   '/v1/completions', '/completions',
   '/v1/embeddings', '/embeddings',
-  '/v1/responses', '/responses',
+  '/v1/responses', '/responses', '/v1/messages', '/messages', '/v1/messages/count_tokens', '/messages/count_tokens',
 ];
 
 // 始终放行：健康检查 + 登录相关接口（登录页/登录接口本身必须公开，否则无法登录）
