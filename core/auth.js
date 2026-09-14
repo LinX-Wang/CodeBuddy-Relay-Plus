@@ -92,7 +92,11 @@ async function pickAccountForRequest(explicitKey, keyAccountId, preferredRegion)
   } else if (keyAccountId) {
     acct = sessionMod.findAccountByIdOrName(keyAccountId);
   } else {
-    const candidates = sessionMod.listAccounts().filter((item) => item.region === preferredRegion && item.auth && item.auth.accessToken);
+    const now = Date.now();
+    const candidates = sessionMod.listAccounts().filter((item) => {
+      if (item.region !== preferredRegion || !item.auth || !item.auth.accessToken) return false;
+      const h = store.accountHealth(item.id); return !h || !h.cool_until || h.cool_until <= now;
+    });
     if (candidates.length) {
       const cursor = ((pool.cursor || 0) % candidates.length + candidates.length) % candidates.length;
       pool.cursor = (cursor + 1) % candidates.length;
@@ -143,7 +147,8 @@ async function probeModels(acct) {
   const valid = await getValidAccount(acct);
   const rc = config.regionConfig(valid.region);
   const headers = { ...buildAuthHeaders(valid), Accept: 'application/json' };
-  const paths = ['/v2/models', '/v2/plugin/models', '/v2/plugin/model/list', '/v1/models'];
+  const eid = (valid.account && valid.account.enterpriseId) || 'personal';
+  const paths = [`/v2/enterprises/${encodeURIComponent(eid)}/models`, '/v2/models', '/v2/plugin/models', '/v2/plugin/model/list', '/v1/models'];
   const errors = [];
   for (const p of paths) {
     try {
