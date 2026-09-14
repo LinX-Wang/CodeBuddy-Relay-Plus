@@ -93,6 +93,8 @@ async function handleProxy(req, res, pathname) {
   let payload = null;
   if (body.length) { try { payload = JSON.parse(body.toString('utf8')); } catch { payload = null; } }
   if (payload == null) payload = {};
+  const multiplier = models.getModelMultiplier(payload.model, store.listModels());
+  if (keyCheck.keyId) { const q = store.apiKeyQuota ? store.apiKeyQuota(keyCheck.keyId) : {credit_limit:0,credit_used:0}; const estimate = ((JSON.stringify(payload).length / 4) + (Number(payload.max_tokens) || 0)) * multiplier; if (q.credit_limit > 0 && q.credit_used + estimate > q.credit_limit) { util.sendJson(res, 402, { error: { message: '积分已耗尽', type: 'quota_exceeded' } }); return true; } }
 
   const cfg = store.getConfig();
   const timeoutMs = store.getRequestTimeoutMs();
@@ -120,7 +122,11 @@ async function handleProxy(req, res, pathname) {
   const accountName = acct ? (acct.name || (acct.account && (acct.account.nickname || acct.account.uid)) || '') : '';
 
   // 记录一次用量
+  const requestStartedAt = Date.now();
+  let firstByteAt = 0;
   const record = (usage, status) => {
+    const credits = ((usage && usage.total_tokens) || 0) * multiplier; if (keyCheck.keyId && credits && store.addApiKeyCredit) store.addApiKeyCredit(keyCheck.keyId, credits);
+    const clientIp = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.headers['x-real-ip'] || req.socket?.remoteAddress || '';
     store.recordUsage({
       source: pathname,
       model: payload.model || '',
@@ -132,12 +138,16 @@ async function handleProxy(req, res, pathname) {
       totalTokens: usage && usage.total_tokens,
       cachedTokens: usage && (usage.prompt_cache_hit_tokens || (usage.prompt_tokens_details && usage.prompt_tokens_details.cached_tokens)),
       durationMs: Date.now() - startedAt,
+      clientIp, estimatedCredits: credits, ttfbMs: firstByteAt ? firstByteAt - requestStartedAt : 0, errorKind: status === 'error' ? 'upstream' : '',
       status,
     });
   };
 
+  const clientIp = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.headers['x-real-ip'] || req.socket?.remoteAddress || '';
   const headers = {
     ...auth.buildAuthHeaders(acct),
+    'X-Agent-Purpose': 'conversation', 'X-IDE-Name': 'CodeBuddy-Relay-Plus', 'X-IDE-Type': 'CodeBuddy-Relay-Plus', 'X-Product': 'CodeBuddy-Relay-Plus',
+    ...(clientIp ? { 'X-Forwarded-For': clientIp, 'X-Real-IP': clientIp, 'X-Client-IP': clientIp } : {}),
     'Content-Type': 'application/json',
     'Accept': (isStream || needAggregate) ? 'text/event-stream' : 'application/json',
     'Accept-Encoding': 'identity',
@@ -154,6 +164,7 @@ async function handleProxy(req, res, pathname) {
         const completion = aggregateSseToCompletion(r.body);
         logger.log('info', 'proxy', `${pathname} 完成 (${Date.now() - startedAt}ms)`, logger.requestSummary(payload, { stream: false, status: 200, durationMs: Date.now() - startedAt, tokens: completion.usage && completion.usage.total_tokens }));
         record(completion.usage, 'ok');
+        store.markAccountHealthy(acct.id);
         util.sendJson(res, 200, completion);
       } else {
         logger.log('warn', 'proxy', `${pathname} 上游非流式响应 ${r.status}`, logger.requestSummary(payload, { status: r.status, durationMs: Date.now() - startedAt }));
@@ -165,6 +176,7 @@ async function handleProxy(req, res, pathname) {
       let usage = null;
       let streamBuffer = '';
       const inspectChunk = (chunk) => {
+        if (!firstByteAt) firstByteAt = Date.now();
         streamBuffer += chunk.toString('utf8');
         let idx;
         while ((idx = streamBuffer.search(/\r?\n\r?\n/)) !== -1) {
@@ -187,6 +199,7 @@ async function handleProxy(req, res, pathname) {
       const r = await util.requestJson(targetUrl, { method: 'POST', headers, body: jsonBody, timeoutMs });
       logger.log('info', 'proxy', `${pathname} 完成 (${Date.now() - startedAt}ms)`, logger.requestSummary(payload, { stream: false, status: r.status, durationMs: Date.now() - startedAt }));
       record(r.json && r.json.usage, r.status === 200 ? 'ok' : 'error');
+      if (r.status === 200) store.markAccountHealthy(acct.id); else if (r.status === 401 || r.status === 404) store.markAccountError(acct.id, r.status === 401 ? 'token_expired' : 'not_found', r.body, 10 * 60 * 1000); else if (r.status === 429) store.markAccountError(acct.id, 'rate_limit', r.body, 60 * 1000); else if (r.status >= 500) store.markAccountError(acct.id, 'server', r.body, 30 * 1000);
       res.writeHead(r.status, {
         'Content-Type': (r.headers && r.headers['content-type']) || 'application/json',
         'Access-Control-Allow-Origin': '*',
@@ -196,6 +209,7 @@ async function handleProxy(req, res, pathname) {
   } catch (e) {
     logger.log('error', 'proxy', `${pathname} 上游错误: ${e.message}`, logger.requestSummary(payload, { stream: isStream, durationMs: Date.now() - startedAt }));
     record(null, 'error');
+    store.markAccountError(acct.id, 'transport', e.message, 30 * 1000);
     if (!res.headersSent) util.sendJson(res, 502, { error: { message: `upstream error: ${e.message}`, type: 'proxy_upstream_error' } });
     else res.end();
   }
