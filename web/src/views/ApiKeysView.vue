@@ -192,6 +192,7 @@ function fmtTime(ts) {
               <th>{{ t('apikeys.colAccount') }}</th>
               <th>{{ t('apikeys.colCreated') }}</th>
               <th>{{ t('apikeys.colUsed') }}</th>
+              <th>积分额度</th>
               <th></th>
             </tr>
           </thead>
@@ -203,6 +204,7 @@ function fmtTime(ts) {
                 </span>
                 <span v-else>{{ k.name || t('apikeys.autoName') }}</span>
               </td>
+              <td class="mono">{{ k.creditLimit > 0 ? `${k.creditUsed || 0} / ${k.creditLimit}` : '不限额' }}</td>
               <td>
                 <code class="key-cell">{{ isRevealed(k) ? k.key : '••••••••••••' }}</code>
                 <button class="btn btn-ghost btn-sm" @click="toggleReveal(k)">
