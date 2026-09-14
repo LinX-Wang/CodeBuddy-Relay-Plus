@@ -17,6 +17,7 @@ const vscode = require('./vscode');
 const auth = require('./auth');
 const openai = require('./openai');
 const responses = require('./responses');
+const anthropic = require('./anthropic');
 const checkin = require('./checkin');
 const checkinScheduler = require('./checkinScheduler');
 const credits = require('./credits');
@@ -28,6 +29,7 @@ function accountPublic(acct) {
   if (!acct) return null;
   const a = acct.account || {};
   const au = acct.auth || {};
+  const health = store.accountHealth(acct.id) || {};
   return {
    id: acct.id,
    name: acct.name || '',
@@ -46,6 +48,14 @@ function accountPublic(acct) {
     lastUsedAt: acct.lastUsedAt || 0,
     useCount: acct.useCount || 0,
     createdAt: acct.createdAt || 0,
+    errorCount: health.err_count || 0,
+    coolUntil: health.cool_until || 0,
+    coolKind: health.cool_kind || '',
+    lastErrorAt: health.last_err_at || 0,
+    lastErrorMessage: health.last_err_msg || '',
+    balanceTotal: health.balance_total || 0,
+    balanceRemain: health.balance_remain || 0,
+    lastSyncAt: health.last_sync_at || 0,
   };
 }
 
@@ -323,7 +333,7 @@ async function route(req, res) {
     try {
       const buf = await util.readBody(req);
       const body = buf.length ? JSON.parse(buf.toString('utf8')) : {};
-      const r = store.addApiKey({ name: body && body.name, key: body && body.key, accountId: body && body.accountId });
+      const r = store.addApiKey({ name: body && body.name, key: body && body.key, accountId: body && body.accountId, creditLimit: body && body.creditLimit });
       if (r.error) { util.sendJson(res, 400, { error: { message: r.error } }); return; }
       logger.log('info', 'config', `新增 API 密钥: ${r.key.name}`);
       util.sendJson(res, 200, { key: r.key });
@@ -694,6 +704,25 @@ async function route(req, res) {
     } catch (e) { util.sendJson(res, 502, { error: { message: e.message } }); }
     return;
   }
+  if (pathname === '/api/models/sync-multipliers' && method === 'POST') {
+    try {
+      const buf = await util.readBody(req); const body = buf.length ? JSON.parse(buf.toString('utf8')) : {};
+      const region = body.region === 'intl' ? 'intl' : 'cn';
+      const acct = sessionMod.listAccounts().find((a) => a.region === region && a.auth && a.auth.accessToken);
+      if (!acct) { util.sendJson(res, 404, { error: { message: `没有可用的${region === 'intl' ? '国际' : '国内'}版账号` } }); return; }
+      const result = await auth.probeModels(acct); let updated = 0; const skipped = [];
+      for (const m of result.models || []) {
+        const id = m.id || m.model || m.model_id || m.name;
+        const raw = m.credits ?? m.credit_multiplier ?? m.multiplier ?? m.cost;
+        const match = typeof raw === 'string' ? raw.match(/x\s*([0-9.]+)/i) : null;
+        const value = typeof raw === 'number' ? raw : (match ? Number(match[1]) : NaN);
+        if (!id || !Number.isFinite(value) || value < 0 || !store.setModelMultiplier(String(id), value, String(raw ?? ''))) { if (id) skipped.push(String(id)); continue; }
+        updated++;
+      }
+      util.sendJson(res, 200, { ok: true, region, endpoint: result.endpoint, updated, skipped });
+    } catch (e) { util.sendJson(res, 502, { error: { message: `同步模型倍率失败: ${e.message}` } }); }
+    return;
+  }
   if (pathname === '/api/models' && method === 'POST') {
     try {
       const buf = await util.readBody(req);
@@ -734,6 +763,10 @@ async function route(req, res) {
 
   /* ---- Responses API ---- */
   if (method === 'POST' && (pathname === '/v1/responses' || pathname === '/responses')) { await responses.handleResponses(req, res); return; }
+
+  /* ---- Anthropic Messages API（Claude Code / CC Switch） ---- */
+  if (method === 'POST' && (pathname === '/v1/messages' || pathname === '/messages')) { await anthropic.handleMessages(req, res); return; }
+  if (method === 'POST' && (pathname === '/v1/messages/count_tokens' || pathname === '/messages/count_tokens')) { await anthropic.handleCountTokens(req, res); return; }
 
   /* ---- OpenAI 兼容转发 ---- */
   if (method === 'POST' && openai.UPSTREAM_MAP[pathname]) { await openai.handleProxy(req, res, pathname); return; }
