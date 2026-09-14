@@ -53,6 +53,7 @@ function getDb() {
       tools            INTEGER NOT NULL DEFAULT 0,
       vision           INTEGER NOT NULL DEFAULT 0,
       reasoning        INTEGER NOT NULL DEFAULT 0,
+      multiplier       REAL,
       region           TEXT NOT NULL DEFAULT 'cn',
       created_at       INTEGER NOT NULL
     );
@@ -65,6 +66,7 @@ function getDb() {
       created_at   INTEGER NOT NULL,
       last_used_at INTEGER NOT NULL DEFAULT 0,
       use_count    INTEGER NOT NULL DEFAULT 0
+      ,credit_limit REAL NOT NULL DEFAULT 0, credit_used REAL NOT NULL DEFAULT 0
     );
     CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_key ON api_keys(key);
 
@@ -180,6 +182,18 @@ function getDb() {
       db.exec("ALTER TABLE api_keys ADD COLUMN account_id TEXT NOT NULL DEFAULT ''");
     }
   } catch { /* 表不存在或已就绪则忽略 */ }
+  // 账号健康状态、审计与积分校正字段（兼容已有 SQLite 数据库）
+  const migrations = [
+    ['api_keys','credit_limit','REAL NOT NULL DEFAULT 0'], ['api_keys','credit_used','REAL NOT NULL DEFAULT 0'],
+    ['models','multiplier','REAL'],
+    ['accounts','err_count','INTEGER NOT NULL DEFAULT 0'], ['accounts','cool_until','INTEGER NOT NULL DEFAULT 0'],
+    ['accounts','cool_kind',"TEXT NOT NULL DEFAULT ''"], ['accounts','last_err_at','INTEGER NOT NULL DEFAULT 0'],
+    ['accounts','last_err_msg',"TEXT NOT NULL DEFAULT ''"], ['accounts','last_picked_at','INTEGER NOT NULL DEFAULT 0'],
+    ['accounts','balance_total','REAL NOT NULL DEFAULT 0'], ['accounts','balance_remain','REAL NOT NULL DEFAULT 0'], ['accounts','last_sync_at','INTEGER NOT NULL DEFAULT 0'],
+    ['usage','ttfb_ms','INTEGER NOT NULL DEFAULT 0'], ['usage','error_kind',"TEXT NOT NULL DEFAULT ''"], ['usage','client_ip',"TEXT NOT NULL DEFAULT ''"],
+    ['usage','estimated_credits','REAL NOT NULL DEFAULT 0'], ['usage','actual_credits','REAL'],
+  ];
+  for (const [table, col, type] of migrations) { try { const cols = db.prepare(`PRAGMA table_info(${table})`).all().map(c=>c.name); if (!cols.includes(col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${type}`); } catch {} }
   // 兼容旧库：若 accounts 表缺少 auto_checkin 列则补充（默认开启）
   try {
     const cols = db.prepare("PRAGMA table_info(accounts)").all().map((c) => c.name);
@@ -410,6 +424,7 @@ function validateModelInput(body) {
       name,
       maxInputTokens: num(body.maxInputTokens),
       maxOutputTokens: num(body.maxOutputTokens),
+      multiplier: Number.isFinite(Number(body.multiplier)) ? Number(body.multiplier) : null,
       tools: bool(body.tools),
       vision: bool(body.vision),
       reasoning: bool(body.reasoning),
@@ -424,13 +439,13 @@ function addModel(body) {
   if (error) return { error };
   const d = getDb();
   d.prepare(
-    'INSERT INTO models(id, name, max_input_tokens, max_output_tokens, tools, vision, reasoning, region, created_at) ' +
-    'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?) ' +
+    'INSERT INTO models(id, name, max_input_tokens, max_output_tokens, tools, vision, reasoning, region, created_at, multiplier) ' +
+    'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ' +
     'ON CONFLICT(id) DO UPDATE SET name=excluded.name, max_input_tokens=excluded.max_input_tokens, ' +
     'max_output_tokens=excluded.max_output_tokens, tools=excluded.tools, vision=excluded.vision, ' +
     'reasoning=excluded.reasoning, region=excluded.region'
   ).run(model.id, model.name, model.maxInputTokens, model.maxOutputTokens,
-        model.tools ? 1 : 0, model.vision ? 1 : 0, model.reasoning ? 1 : 0, model.region, model.createdAt);
+        model.tools ? 1 : 0, model.vision ? 1 : 0, model.reasoning ? 1 : 0, model.region, model.createdAt, model.multiplier);
   return { model };
 }
 
@@ -444,6 +459,7 @@ function listModels() {
     tools: !!r.tools,
     vision: !!r.vision,
     reasoning: !!r.reasoning,
+    multiplier: r.multiplier == null ? null : Number(r.multiplier),
     region: r.region,
     createdAt: r.created_at,
   }));
@@ -589,13 +605,13 @@ function apiKeyValid(provided) {
 /** 返回命中的密钥信息 { id, name, accountId }，未命中返回 null。会更新最近使用。 */
 function resolveApiKey(provided) {
   const d = getDb();
-  const rows = d.prepare('SELECT id, name, key, account_id FROM api_keys').all();
+  const rows = d.prepare('SELECT id, name, key, account_id, credit_limit, credit_used FROM api_keys').all();
   const b = Buffer.from(String(provided));
   for (const r of rows) {
     const a = Buffer.from(r.key);
     if (a.length === b.length && crypto.timingSafeEqual(a, b)) {
       d.prepare('UPDATE api_keys SET last_used_at = ?, use_count = use_count + 1 WHERE key = ?').run(Date.now(), r.key);
-      return { id: r.id, name: r.name || '', accountId: r.account_id || '' };
+      return { id: r.id, name: r.name || '', accountId: r.account_id || '', creditLimit: r.credit_limit || 0, creditUsed: r.credit_used || 0 };
     }
   }
   return null;
@@ -618,22 +634,41 @@ function recordUsage({
   accountId = '', accountName = '',
   apiKeyId = '', apiKeyName = '',
   promptTokens = 0, completionTokens = 0, totalTokens = 0,
-  cachedTokens = 0, durationMs = 0, status = 'ok',
+  cachedTokens = 0, durationMs = 0, ttfbMs = 0, errorKind = '', clientIp = '', estimatedCredits = 0, actualCredits = null, status = 'ok',
 } = {}) {
   try {
+    const id = genUsageId();
     getDb().prepare(
       'INSERT INTO usage(id, ts, source, model, stream, account_id, account_name, api_key_id, api_key_name, ' +
-      'prompt_tokens, completion_tokens, total_tokens, cached_tokens, duration_ms, status) ' +
-      'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+      'prompt_tokens, completion_tokens, total_tokens, cached_tokens, duration_ms, ttfb_ms, error_kind, client_ip, estimated_credits, actual_credits, status) ' +
+      'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
     ).run(
-      genUsageId(), Date.now(), String(source || ''), String(model || ''),
+      id, Date.now(), String(source || ''), String(model || ''),
       stream ? 1 : 0, String(accountId || ''), String(accountName || ''),
       String(apiKeyId || ''), String(apiKeyName || ''),
       asInt(promptTokens), asInt(completionTokens), asInt(totalTokens),
-      asInt(cachedTokens), asInt(durationMs), status === 'error' ? 'error' : 'ok'
+      asInt(cachedTokens), asInt(durationMs), asInt(ttfbMs), String(errorKind || ''), String(clientIp || ''), Number(estimatedCredits) || 0, actualCredits == null ? null : Number(actualCredits), status === 'error' ? 'error' : 'ok'
     );
+    return id;
   } catch { /* 用量写入失败不应影响请求 */ }
 }
+function setModelMultiplier(id, multiplier, rawCredits = '') {
+  const d = getDb(); const m = getModel(id);
+  if (m) { d.prepare('UPDATE models SET multiplier=? WHERE id=?').run(Number(multiplier), id); return true; }
+  const builtin = require('./models').MODEL_CATALOG.find(x => x.id === id);
+  if (!builtin) return false;
+  d.prepare('INSERT OR REPLACE INTO models(id,name,max_input_tokens,max_output_tokens,tools,vision,reasoning,region,created_at,multiplier) VALUES(?,?,?,?,?,?,?,?,?,?)').run(id,builtin.name,builtin.maxInputTokens||0,builtin.maxOutputTokens||0,builtin.tools?1:0,builtin.vision?1:0,builtin.reasoning?1:0,builtin.region||'cn',Date.now(),Number(multiplier));
+  return true;
+}
+function addApiKeyCredit(id, amount) { try { getDb().prepare('UPDATE api_keys SET credit_used=credit_used+? WHERE id=?').run(Math.max(0, Number(amount)||0), id); } catch {} }
+function apiKeyQuota(id) { try { return getDb().prepare('SELECT credit_limit, credit_used FROM api_keys WHERE id=?').get(id) || {credit_limit:0,credit_used:0}; } catch { return {credit_limit:0,credit_used:0}; } }
+function listPendingUsage(ageMs = 60000, limit = 100) { try { return getDb().prepare("SELECT * FROM usage WHERE actual_credits IS NULL AND status='ok' AND ts <= ? ORDER BY ts ASC LIMIT ?").all(Date.now()-ageMs, limit); } catch { return []; } }
+function setUsageActualCredits(id, value) { try { const row=getDb().prepare('SELECT api_key_id,estimated_credits FROM usage WHERE id=?').get(id); getDb().prepare('UPDATE usage SET actual_credits=? WHERE id=?').run(Number(value)||0,id); if(row && row.api_key_id) getDb().prepare('UPDATE api_keys SET credit_used=MAX(0, credit_used-?+?) WHERE id=?').run(Number(row.estimated_credits)||0,Number(value)||0,row.api_key_id); } catch {} }
+function updateAccountBalance(id,total,remain) { try { getDb().prepare('UPDATE accounts SET balance_total=?, balance_remain=?, last_sync_at=? WHERE id=?').run(Number(total)||0,Number(remain)||0,Date.now(),id); } catch {} }
+
+function accountHealth(id) { try { return getDb().prepare('SELECT err_count, cool_until, cool_kind, last_err_at, last_err_msg, last_picked_at, balance_total, balance_remain, last_sync_at FROM accounts WHERE id=?').get(id) || null; } catch { return null; } }
+function markAccountError(id, kind, message, coolMs = 0) { try { const now=Date.now(); const r=accountHealth(id)||{}; const count=(r.err_count||0)+1; const until=coolMs?now+coolMs:0; getDb().prepare('UPDATE accounts SET err_count=?, cool_until=?, cool_kind=?, last_err_at=?, last_err_msg=? WHERE id=?').run(count,until,String(kind||''),now,String(message||'').slice(0,500),id); } catch {} }
+function markAccountHealthy(id) { try { getDb().prepare("UPDATE accounts SET err_count=0, cool_until=0, cool_kind='', last_err_msg='' WHERE id=?").run(id); } catch {} }
 
 function mapUsageRow(r) {
   return {
@@ -652,6 +687,11 @@ function mapUsageRow(r) {
     cachedTokens: r.cached_tokens || 0,
     cacheHitRate: cacheHitRate(r.cached_tokens || 0, r.prompt_tokens),
     durationMs: r.duration_ms,
+    ttfbMs: r.ttfb_ms || 0,
+    errorKind: r.error_kind || '',
+    clientIp: r.client_ip || '',
+    estimatedCredits: r.estimated_credits || 0,
+    actualCredits: r.actual_credits,
     status: r.status,
   };
 }
@@ -1202,7 +1242,7 @@ module.exports = {
   getCreditSnapshot, setCreditSnapshot, deleteCreditSnapshots,
 
   // 自定义模型
-  addModel, listModels, removeModel, getModel,
+  addModel, setModelMultiplier, listModels, removeModel, getModel,
   getHiddenModels, setModelHidden,
 
   getConfig, setConfig, publicValues, applyPublicPatch,
@@ -1214,7 +1254,7 @@ module.exports = {
   regenerateApiKey, removeApiKey, setApiKeyAccount, apiKeyValid, resolveApiKey, clientKeyVerificationEnabled,
 
   // 用量记录
-  recordUsage, queryUsage, usageStatsByDay, usageTotals,
+  recordUsage, accountHealth, markAccountError, markAccountHealthy, updateAccountBalance, addApiKeyCredit, apiKeyQuota, listPendingUsage, setUsageActualCredits, queryUsage, usageStatsByDay, usageTotals,
 
   // 管理页鉴权
   adminAuthEnabled, adminConfigured, getAdminUser, setAdminPassword, verifyAdminPassword,
